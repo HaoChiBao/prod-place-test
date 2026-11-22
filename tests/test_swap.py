@@ -232,6 +232,94 @@ def test_aspect_follows_the_frame_instead_of_stretching_it():
     assert video_request("prompt", "https://media.example/v.mp4", 2, 1, aspect_ratio="9:16")["aspect_ratio"] == "9:16"
 
 
+def test_rotated_source_asks_for_the_window_aspect(tmp_path):
+    wide = tmp_path / "wide.mp4"
+    video = tmp_path / "phone.mp4"
+    _color(wide, "green", "320x180", 3, 25, audio=False)
+    _ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-display_rotation",
+            "90",
+            "-i",
+            str(wide),
+            "-c",
+            "copy",
+            str(video),
+        ]
+    )
+    coded = _probe(video)
+    assert (coded["width"], coded["height"]) == (320, 180)
+    save_findings(
+        video,
+        [
+            {
+                "label": "cup",
+                "category": "other",
+                "start_s": 0.2,
+                "end_s": 1.0,
+                "visibility": 1.0,
+                "boxes": [{"t": 0.5, "x": 40, "y": 100, "w": 40, "h": 50}],
+            }
+        ],
+        root=tmp_path,
+    )
+    clip = list_clips(tmp_path)[0]
+    standin = tmp_path / "standin.mp4"
+    _color(standin, "blue", "64x64", 1, 25, audio=False)
+    payload = standin.read_bytes()
+    seen = {}
+
+    def upload(path, key, content_type):
+        return "https://media.example/" + key
+
+    def transport(method, url, body):
+        if method == "GET" and url.endswith("/models"):
+            return {
+                "data": [
+                    {
+                        "id": "alibaba/wan-3.0",
+                        "supported_durations": [2, 4, 6],
+                        "supported_aspect_ratios": ["16:9", "9:16", "1:1", "4:3", "3:4"],
+                    }
+                ]
+            }
+        if method == "POST":
+            seen["body"] = body
+            return {"id": "job-rot", "status": "pending"}
+        if method == "GET" and url.endswith("/job-rot"):
+            return {
+                "id": "job-rot",
+                "status": "completed",
+                "unsigned_urls": ["https://cdn.example/out.mp4"],
+            }
+        if method == "GET" and "cdn.example" in url:
+            return payload
+        raise AssertionError((method, url))
+
+    job = start_swap(
+        clip_id=clip["id"],
+        object_id=clip["objects"][0]["id"],
+        product="Starbucks cup",
+        image=None,
+        root=tmp_path,
+        deps=SwapDeps(transport=transport, upload=upload, sleep=lambda _seconds: None),
+    )
+    deadline = time.monotonic() + 30
+    current = job
+    while time.monotonic() < deadline:
+        current = get_swap(job["id"])
+        if current and current["status"] in {"completed", "failed"}:
+            break
+        time.sleep(0.05)
+    assert current["status"] == "completed", current
+    assert seen["body"]["aspect_ratio"] == "9:16"
+
+
 def test_window_is_padded_and_clamped_to_the_model_max():
     supported, model_max = durations_for(
         {

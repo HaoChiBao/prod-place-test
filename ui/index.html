@@ -436,30 +436,37 @@
     }
 
     let leader = null;
-    let echoing = false;
+    let echoPlay = null;
     function follow(from, to) {
       from.addEventListener("play", () => {
-        if (echoing) return;
+        if (echoPlay === from) {
+          echoPlay = null;
+          return;
+        }
         leader = from;
         if (!to.getAttribute("src")) return;
-        echoing = true;
+        echoPlay = to;
+        if (!to.paused) {
+          echoPlay = null;
+          return;
+        }
         const pending = to.play();
-        const release = () => { echoing = false; };
-        if (pending && pending.then) pending.then(release, release);
-        else release();
+        if (pending && pending.catch) {
+          pending.catch(() => {
+            if (echoPlay === to) echoPlay = null;
+          });
+        }
       });
       from.addEventListener("pause", () => {
-        if (echoing || leader !== from) return;
-        echoing = true;
+        if (to.paused) return;
         to.pause();
-        echoing = false;
       });
       from.addEventListener("seeked", () => {
-        if (echoing || leader !== from || !to.getAttribute("src")) return;
+        if (!to.getAttribute("src")) return;
         if (Math.abs(from.currentTime - to.currentTime) > 0.05) to.currentTime = from.currentTime;
       });
       from.addEventListener("timeupdate", () => {
-        if (echoing || leader !== from || from.paused || !to.getAttribute("src")) return;
+        if (leader !== from || from.paused || !to.getAttribute("src")) return;
         if (Math.abs(from.currentTime - to.currentTime) > 0.3) to.currentTime = from.currentTime;
       });
     }

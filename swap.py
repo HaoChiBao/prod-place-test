@@ -577,7 +577,7 @@ def execute_swap(job_id: str, *, root: Path | None, deps: SwapDeps, key: str) ->
     supported, model_max, aspects = _model_limits(
         transport, sleep=sleep, clock=clock, deadline=model_deadline, interval=interval
     )
-    duration_s, width, height = probe_video(video)
+    duration_s, _, _ = probe_video(video)
     span = float(obj["end_s"]) - float(obj["start_s"])
     duration = choose_duration(span, supported, duration_s, model_max)
     start, _end = place_window(float(obj["start_s"]), float(obj["end_s"]), duration_s, duration)
@@ -586,6 +586,9 @@ def execute_swap(job_id: str, *, root: Path | None, deps: SwapDeps, key: str) ->
     folder = catalog_dir(root) / "swaps" / job_id
     window = folder / "window.mp4"
     cut_window(video, window, start, duration)
+    picture = _streams(window)
+    width = int(picture["width"])
+    height = int(picture["height"])
     _update(job_id, window_ready=True, detail="uploading")
 
     video_url = upload(window, f"swaps/{job_id}/window.mp4", "video/mp4")
