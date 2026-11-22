@@ -474,7 +474,7 @@ def _object_items(text: str) -> list:
     data = _parse_json(text)
     if isinstance(data, dict) and isinstance(data.get("objects"), list):
         return data["objects"]
-    if isinstance(data, list):
+    if isinstance(data, list) and all(isinstance(item, dict) for item in data):
         return data
     raise RuntimeError("missing objects")
 
@@ -494,15 +494,25 @@ def _parse_json(text: str) -> Any:
 
 
 def _extract_json(text: str) -> Any | None:
-    """First JSON object or array in text, so a preamble does not drop the batch."""
-    starts = [i for i in (text.find("{"), text.find("[")) if i >= 0]
-    if not starts:
-        return None
-    try:
-        value, _ = json.JSONDecoder().raw_decode(text[min(starts) :])
-    except json.JSONDecodeError:
-        return None
-    return value
+    """The objects payload, not a preamble array such as a frame index or box_2d."""
+    decoder = json.JSONDecoder()
+    object_list = None
+    index = 0
+    while index < len(text):
+        if text[index] not in "{[":
+            index += 1
+            continue
+        try:
+            value, consumed = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            index += 1
+            continue
+        if isinstance(value, dict) and isinstance(value.get("objects"), list):
+            return value
+        if object_list is None and isinstance(value, list) and all(isinstance(item, dict) for item in value):
+            object_list = value
+        index += max(consumed, 1)
+    return object_list
 
 
 def _video_duration(data: dict) -> float | None:
