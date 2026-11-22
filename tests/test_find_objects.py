@@ -691,6 +691,19 @@ def test_reasoning_preamble_does_not_drop_the_json():
     assert _object_items(_message_text(body)) == [{"frame": 0, "label": "wine bottle"}]
 
 
+def test_preamble_box_does_not_replace_the_objects():
+    """A box_2d array before the payload must not be treated as the batch result."""
+    from find_objects import _object_items
+
+    text = (
+        "Frames [0, 1] and box_2d [100, 200, 300, 400].\n"
+        '{"objects":[{"frame":0,"label":"wine bottle"}]}'
+    )
+    assert _object_items(text) == [{"frame": 0, "label": "wine bottle"}]
+    with pytest.raises(RuntimeError, match="missing objects"):
+        _object_items("[100, 200, 300, 400]")
+
+
 def test_save_flag_stores_the_clip_for_the_ui(tmp_path, monkeypatch, capsys):
     from find_objects import main
     from store import list_clips
