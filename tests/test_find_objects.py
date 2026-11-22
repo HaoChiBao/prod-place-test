@@ -73,6 +73,9 @@ def test_keyframe_times_are_about_one_per_second_and_clear_of_cuts():
     assert len(short) == 3
     assert short[0] >= 2.15
     assert short[-1] <= 3.85
+    # Exactly 0.3s can sit one frame on the margin. Anything shorter is a cut frame.
+    assert keyframe_times(0.0, 0.3) == [0.15]
+    assert keyframe_times(1.0, 1.2) == []
 
 
 def test_shot_ranges_are_the_spans_between_cuts():
@@ -413,9 +416,13 @@ def test_find_objects_converts_merges_and_drops_with_http_mocked(tmp_path, monke
                         "box_2d": [10, 10, 10, 40],
                     }
                 )
-        return {"choices": [{"message": {"content": json.dumps({"objects": objects})}}]}
+        return {
+            "choices": [{"message": {"content": json.dumps({"objects": objects})}}],
+            "usage": {"cost": 0.0125},
+        }
 
-    found = find_objects(video, request=request)
+    usage = {}
+    found = find_objects(video, request=request, usage=usage)
     assert calls
     assert [len([p for p in call["messages"][0]["content"] if p["type"] == "image_url"]) for call in calls] == [
         FRAMES_PER_CALL,
@@ -473,6 +480,8 @@ def test_find_objects_converts_merges_and_drops_with_http_mocked(tmp_path, monke
     plate = by_label["dinner plate"]
     assert len(plate["boxes"]) == 1
     assert plate["boxes"][0]["w"] > 20
+    assert usage["calls"] == 2
+    assert usage["cost_usd"] == pytest.approx(0.025)
 
 
 def test_prompt_names_the_fields_and_the_frame_times():
@@ -481,6 +490,8 @@ def test_prompt_names_the_fields_and_the_frame_times():
     assert "Frame 1 at 1.000s" in text
     assert "suggested_product" in text
     assert "visibility" in text
+    assert "category food" in text
+    assert "plate" in text
 
 
 def test_ask_reads_frames_retries_and_redacts(tmp_path, capsys):
@@ -567,3 +578,166 @@ def test_find_objects_requires_a_key(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
         find_objects(tmp_path / "missing.mp4")
+
+
+def test_duration_follows_the_video_stream_not_a_longer_audio_track(tmp_path):
+    """A 1s picture with 3s of audio used to be probed as 3s, then frame 1.5s failed."""
+    video = tmp_path / "long-audio.mp4"
+    subprocess.check_call(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=green:s=64x64:d=1:r=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=d=3",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-pix_fmt",
+            "yuv420p",
+            str(video),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    from find_objects import probe_video
+
+    duration, width, height = probe_video(video)
+    assert (width, height) == (64, 64)
+    assert duration == pytest.approx(1.0, abs=0.05)
+    calls = {"n": 0}
+
+    def request(payload):
+        calls["n"] += 1
+        return {"choices": [{"message": {"content": '{"objects":[]}'}}], "usage": {"cost": 0.001}}
+
+    usage = {}
+    found = find_objects(video, request=request, usage=usage)
+    assert found == []
+    assert calls["n"] == 1
+    assert usage["cost_usd"] == pytest.approx(0.001)
+    times = keyframe_times(0.0, duration)
+    assert times
+    assert max(times) < duration
+
+
+def test_one_bad_batch_keeps_objects_from_the_batches_that_worked(tmp_path):
+    video = tmp_path / "clip.mp4"
+    _write_clip(video)
+    calls = {"n": 0}
+
+    def request(payload):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("bad json")
+        text = payload["messages"][0]["content"][0]["text"]
+        objects = []
+        for index, t in re.findall(r"Frame (\d+) at ([0-9.]+)s", text):
+            objects.append(
+                {
+                    "frame": int(index),
+                    "label": "green wine bottle",
+                    "category": "bottle",
+                    "suggested_product": "branded wine bottle",
+                    "visibility": 0.9,
+                    "box_2d": [100, 100, 400, 200],
+                }
+            )
+        return {"choices": [{"message": {"content": json.dumps({"objects": objects})}}]}
+
+    found = find_objects(video, request=request)
+    assert calls["n"] == 3
+    assert any(obj["label"] == "green wine bottle" for obj in found)
+
+
+def test_every_batch_failing_raises(tmp_path):
+    video = tmp_path / "clip.mp4"
+    _write_clip(video)
+
+    def request(payload):
+        raise RuntimeError("bad json")
+
+    with pytest.raises(RuntimeError, match="no frame batch"):
+        find_objects(video, request=request)
+
+
+def test_reasoning_preamble_does_not_drop_the_json():
+    from find_objects import _message_text, _object_items
+
+    body = {
+        "choices": [
+            {
+                "message": {
+                    "content": [
+                        {"type": "reasoning", "text": "The bottle is on the table."},
+                        {
+                            "type": "text",
+                            "text": 'Note:\n{"objects":[{"frame":0,"label":"wine bottle"}]}',
+                        },
+                    ]
+                }
+            }
+        ]
+    }
+    assert _object_items(_message_text(body)) == [{"frame": 0, "label": "wine bottle"}]
+
+
+def test_preamble_box_does_not_replace_the_objects():
+    """A box_2d array before the payload must not be treated as the batch result."""
+    from find_objects import _object_items
+
+    text = (
+        "Frames [0, 1] and box_2d [100, 200, 300, 400].\n"
+        '{"objects":[{"frame":0,"label":"wine bottle"}]}'
+    )
+    assert _object_items(text) == [{"frame": 0, "label": "wine bottle"}]
+    with pytest.raises(RuntimeError, match="missing objects"):
+        _object_items("[100, 200, 300, 400]")
+
+
+def test_save_flag_stores_the_clip_for_the_ui(tmp_path, monkeypatch, capsys):
+    from find_objects import main
+    from store import list_clips
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    video = tmp_path / "suits.mp4"
+    video.write_bytes(b"video")
+
+    def fake(path, usage=None, request=None):
+        usage["cost_usd"] = 0.025
+        usage["calls"] = 1
+        return [
+            {
+                "label": "green wine bottle",
+                "category": "bottle",
+                "suggested_product": "branded wine bottle",
+                "shot_index": 0,
+                "start_s": 2.0,
+                "end_s": 4.0,
+                "visibility": 0.9,
+                "boxes": [{"t": 2.15, "x": 10, "y": 20, "w": 30, "h": 40}],
+            }
+        ]
+
+    monkeypatch.setattr("find_objects.find_objects", fake)
+    assert main(["--save", str(video)]) == 0
+    captured = capsys.readouterr()
+    saved = json.loads(captured.out)
+    assert saved[0]["label"] == "green wine bottle"
+    assert "cost_usd 0.025000" in captured.err
+    assert _KEY not in captured.err
+    clips = list_clips()
+    assert clips[0]["name"] == "suits.mp4"
+    assert clips[0]["cost_usd"] == 0.025
+    assert clips[0]["objects"][0]["start_s"] == 2.0
+    assert clips[0]["objects"][0]["end_s"] == 4.0
+    assert clips[0]["objects"][0]["boxes"][0]["x"] == 10

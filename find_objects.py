@@ -66,7 +66,7 @@ def probe_video(path: Path) -> tuple[float, int, int]:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:stream=width,height",
+            "format=duration:stream=width,height,duration",
             "-of",
             "json",
             str(path),
@@ -77,10 +77,10 @@ def probe_video(path: Path) -> tuple[float, int, int]:
     if not streams:
         raise RuntimeError(f"no video stream in {path}")
     stream = streams[0]
-    raw_duration = (data.get("format") or {}).get("duration") or stream.get("duration")
-    if raw_duration is None:
+    duration = _video_duration(data)
+    if duration is None:
         raise RuntimeError(f"no duration for {path}")
-    return float(raw_duration), int(stream["width"]), int(stream["height"])
+    return duration, int(stream["width"]), int(stream["height"])
 
 
 def scene_cuts(path: Path) -> list[float]:
@@ -120,6 +120,9 @@ def keyframe_times(start_s: float, end_s: float) -> list[float]:
     start, end = float(start_s), float(end_s)
     span = end - start
     if span <= 0:
+        return []
+    # Shorter than 0.3s cannot place a frame 0.15s clear of both cuts.
+    if span < 2 * CUT_MARGIN_S:
         return []
     if span <= 2 * CUT_MARGIN_S:
         return [round((start + end) / 2.0, 3)]
@@ -219,8 +222,17 @@ def merge_objects(
     return found
 
 
-def find_objects(video_path: str | Path, *, request: Request | None = None) -> list[dict]:
-    """Return swappable objects with timestamps and pixel boxes."""
+def find_objects(
+    video_path: str | Path,
+    *,
+    request: Request | None = None,
+    usage: dict | None = None,
+) -> list[dict]:
+    """Return swappable objects with timestamps and pixel boxes.
+
+    ``usage``, when passed, receives ``cost_usd`` and ``calls`` from OpenRouter.
+    One batch that never returns JSON is skipped. Every batch failing raises.
+    """
     path = Path(video_path)
     key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
     if request is None:
@@ -233,15 +245,30 @@ def find_objects(video_path: str | Path, *, request: Request | None = None) -> l
     duration, _, _ = probe_video(path)
     shots = shot_ranges(scene_cuts(path), duration)
     if not shots:
+        if usage is not None:
+            usage["cost_usd"] = 0.0
+            usage["calls"] = 0
         return []
     per_shot = [keyframe_times(start, end) for start, end in shots]
 
+    costs: list[float] = []
     with tempfile.TemporaryDirectory(prefix="swap-frames-") as tmp:
         frames = _extract_frames(path, per_shot, Path(tmp))
         detections: list[dict] = []
-        for batch in _chunks(frames, FRAMES_PER_CALL):
-            items = _ask(batch, request, key)
+        batches = _chunks(frames, FRAMES_PER_CALL)
+        failures = 0
+        for batch in batches:
+            try:
+                items = _ask(batch, request, key, costs)
+            except RuntimeError:
+                failures += 1
+                continue
             detections.extend(_detections_in_batch(items, batch))
+    if usage is not None:
+        usage["cost_usd"] = round(sum(costs), 6)
+        usage["calls"] = len(costs)
+    if batches and failures == len(batches):
+        raise RuntimeError("product identification failed; no frame batch returned a valid answer")
     return merge_objects(detections, shots, per_shot)
 
 
@@ -250,28 +277,45 @@ def prompt_for(times: list[float]) -> str:
     last = max(0, len(times) - 1)
     return (
         "List EXISTING visible objects that could be swapped for a branded product "
-        "(bottles, cans, glasses, cups, devices, packaging). "
+        "(bottles, cans, glasses, cups, devices, packaging, food, plates). "
         "Never list empty surfaces or places to put something. "
         "Box only the object itself. "
         f"There are {len(times)} frames in order ({listing}). "
-        f"For each object return frame (0 to {last}), label, category, "
+        f"For each object return frame (0 to {last}), label, "
+        "category (one word: bottle, can, glass, cup, device, packaging, food, plate, "
+        "or another specific object word), "
         "suggested_product, visibility (0-1), and box_2d as "
         "[ymin, xmin, ymax, xmax] normalized 0-1000, not 0-1. "
+        "Use category food for food and plate for the dish under it. "
         'JSON only: {"objects":[...]}.'
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    save = False
+    if args and args[0] == "--save":
+        save = True
+        args = args[1:]
     if len(args) != 1:
-        print("usage: python find_objects.py VIDEO", file=sys.stderr)
+        print("usage: python find_objects.py [--save] VIDEO", file=sys.stderr)
         return 2
-    json.dump(find_objects(args[0]), sys.stdout, indent=2)
+    spent: dict = {}
+    found = find_objects(args[0], usage=spent)
+    if save:
+        from store import save_findings
+
+        clip_id = save_findings(args[0], found, spent.get("cost_usd"))
+        print(f"saved {clip_id}", file=sys.stderr)
+    json.dump(found, sys.stdout, indent=2)
     sys.stdout.write("\n")
+    cost = spent.get("cost_usd")
+    if cost is not None:
+        print(f"cost_usd {cost:.6f}", file=sys.stderr)
     return 0
 
 
-def _ask(batch: list[dict], request: Request, key: str) -> list:
+def _ask(batch: list[dict], request: Request, key: str, costs: list[float] | None = None) -> list:
     payload = {
         "model": MODEL,
         "messages": [
@@ -288,6 +332,8 @@ def _ask(batch: list[dict], request: Request, key: str) -> list:
     for _ in range(2):
         try:
             body = request(payload)
+            if costs is not None:
+                costs.append(_usage_cost(body))
             return _object_items(_message_text(body))
         except Exception as exc:
             last = str(exc)
@@ -412,6 +458,9 @@ def _message_text(body: Any) -> str:
             if isinstance(part, str):
                 parts.append(part)
             elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                kind = str(part.get("type") or "text").lower()
+                if kind in {"reasoning", "thinking", "reasoning_text"}:
+                    continue
                 parts.append(part["text"])
         text = "".join(parts)
     else:
@@ -425,7 +474,7 @@ def _object_items(text: str) -> list:
     data = _parse_json(text)
     if isinstance(data, dict) and isinstance(data.get("objects"), list):
         return data["objects"]
-    if isinstance(data, list):
+    if isinstance(data, list) and all(isinstance(item, dict) for item in data):
         return data
     raise RuntimeError("missing objects")
 
@@ -437,8 +486,59 @@ def _parse_json(text: str) -> Any:
         raw = fenced.group(1).strip()
     try:
         return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("invalid JSON") from exc
+    except json.JSONDecodeError:
+        extracted = _extract_json(raw)
+        if extracted is None:
+            raise RuntimeError("invalid JSON")
+        return extracted
+
+
+def _extract_json(text: str) -> Any | None:
+    """The objects payload, not a preamble array such as a frame index or box_2d."""
+    decoder = json.JSONDecoder()
+    object_list = None
+    index = 0
+    while index < len(text):
+        if text[index] not in "{[":
+            index += 1
+            continue
+        try:
+            value, consumed = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            index += 1
+            continue
+        if isinstance(value, dict) and isinstance(value.get("objects"), list):
+            return value
+        if object_list is None and isinstance(value, list) and all(isinstance(item, dict) for item in value):
+            object_list = value
+        index += max(consumed, 1)
+    return object_list
+
+
+def _video_duration(data: dict) -> float | None:
+    """Video-stream length. The container duration includes a longer audio track."""
+    streams = data.get("streams") or []
+    stream = streams[0] if streams else {}
+    stream_len = _finite(stream.get("duration"))
+    if stream_len is not None and stream_len > 0:
+        return stream_len
+    format_len = _finite((data.get("format") or {}).get("duration"))
+    if format_len is not None and format_len > 0:
+        return format_len
+    return None
+
+
+def _usage_cost(body: Any) -> float:
+    if not isinstance(body, dict):
+        return 0.0
+    usage = body.get("usage")
+    if not isinstance(usage, dict):
+        return 0.0
+    for name in ("cost", "total_cost"):
+        number = _finite(usage.get(name))
+        if number is not None and number >= 0:
+            return number
+    return 0.0
 
 
 def _jpeg_size(data: bytes) -> tuple[int, int]:

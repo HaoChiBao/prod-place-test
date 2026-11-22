@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Swappable objects</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.4 "Segoe UI", sans-serif;
+      background: #12141a;
+      color: #f2f4f8;
+    }
+    header {
+      padding: 16px 20px 8px;
+    }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    p.note { margin: 0; color: #a8b0c0; font-size: 13px; }
+    main { display: grid; grid-template-columns: 280px 1fr; gap: 16px; padding: 12px 20px 24px; }
+    .clips, .objects { display: flex; flex-direction: column; gap: 8px; }
+    button.clip, button.obj {
+      text-align: left;
+      background: #1c2030;
+      color: inherit;
+      border: 1px solid #2c3348;
+      border-radius: 8px;
+      padding: 10px 12px;
+      cursor: pointer;
+    }
+    button.clip[aria-pressed="true"], button.obj[aria-pressed="true"] {
+      border-color: #f5c518;
+      background: #2a2614;
+    }
+    button .meta { display: block; color: #a8b0c0; font-size: 12px; margin-top: 2px; }
+    .stage {
+      position: relative;
+      width: min(100%, 960px);
+      background: #000;
+    }
+    video { display: block; width: 100%; height: auto; background: #000; }
+    .box {
+      position: absolute;
+      border: 2px solid #f5c518;
+      box-shadow: 0 0 0 1px rgba(0,0,0,.6);
+      pointer-events: none;
+    }
+    .box span {
+      position: absolute;
+      left: 0;
+      top: -22px;
+      background: #f5c518;
+      color: #1a1400;
+      font-size: 12px;
+      font-weight: 650;
+      padding: 1px 6px;
+      white-space: nowrap;
+    }
+    .empty { color: #a8b0c0; }
+    @media (max-width: 800px) {
+      main { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Swappable objects</h1>
+    <p class="note">Pick a clip, then an object. The video jumps to when it appears and the box is drawn on the frame.</p>
+  </header>
+  <main>
+    <section>
+      <div class="clips" id="clips"></div>
+    </section>
+    <section>
+      <div class="stage">
+        <video id="video" controls playsinline></video>
+        <div class="box" id="box" hidden><span id="box-label"></span></div>
+      </div>
+      <div class="objects" id="objects"></div>
+    </section>
+  </main>
+  <script>
+    const clipsEl = document.getElementById("clips");
+    const objectsEl = document.getElementById("objects");
+    const video = document.getElementById("video");
+    const boxEl = document.getElementById("box");
+    const boxLabel = document.getElementById("box-label");
+    let clips = [];
+    let selectedClip = null;
+    let selectedObject = null;
+
+    function fmt(t) {
+      return (Math.round(Number(t) * 10) / 10).toFixed(1);
+    }
+
+    function rangeText(obj) {
+      return fmt(obj.start_s) + "–" + fmt(obj.end_s) + "s";
+    }
+
+    function boxAt(object, time) {
+      const boxes = object.boxes || [];
+      if (!boxes.length) return null;
+      let chosen = boxes[0];
+      for (const box of boxes) {
+        if (box.t <= time + 0.001) chosen = box;
+      }
+      return chosen;
+    }
+
+    function draw() {
+      if (!selectedObject || !video.videoWidth) {
+        boxEl.hidden = true;
+        return;
+      }
+      const t = video.currentTime;
+      if (t < selectedObject.start_s - 0.05 || t > selectedObject.end_s + 0.05) {
+        boxEl.hidden = true;
+        return;
+      }
+      const box = boxAt(selectedObject, t);
+      if (!box) {
+        boxEl.hidden = true;
+        return;
+      }
+      boxEl.hidden = false;
+      boxEl.style.left = (box.x / video.videoWidth * 100) + "%";
+      boxEl.style.top = (box.y / video.videoHeight * 100) + "%";
+      boxEl.style.width = (box.w / video.videoWidth * 100) + "%";
+      boxEl.style.height = (box.h / video.videoHeight * 100) + "%";
+      boxLabel.textContent = selectedObject.label;
+    }
+
+    function renderClips() {
+      clipsEl.replaceChildren();
+      if (!clips.length) {
+        const p = document.createElement("p");
+        p.className = "empty";
+        p.textContent = "No clips stored yet.";
+        clipsEl.appendChild(p);
+        return;
+      }
+      for (const clip of clips) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "clip";
+        button.setAttribute("aria-pressed", selectedClip && selectedClip.id === clip.id ? "true" : "false");
+        const name = document.createElement("strong");
+        name.textContent = clip.name;
+        const meta = document.createElement("span");
+        meta.className = "meta";
+        const bits = [clip.objects.length + (clip.objects.length === 1 ? " object" : " objects")];
+        if (clip.cost_usd != null) bits.push("$" + Number(clip.cost_usd).toFixed(3));
+        meta.textContent = bits.join(" · ");
+        button.append(name, meta);
+        button.addEventListener("click", () => selectClip(clip.id));
+        clipsEl.appendChild(button);
+      }
+    }
+
+    function renderObjects() {
+      objectsEl.replaceChildren();
+      if (!selectedClip) return;
+      if (!selectedClip.objects.length) {
+        const p = document.createElement("p");
+        p.className = "empty";
+        p.textContent = "No swappable objects in this clip.";
+        objectsEl.appendChild(p);
+        return;
+      }
+      for (const obj of selectedClip.objects) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "obj";
+        button.setAttribute("aria-pressed", selectedObject && selectedObject.id === obj.id ? "true" : "false");
+        const label = document.createElement("strong");
+        label.textContent = obj.label;
+        const meta = document.createElement("span");
+        meta.className = "meta";
+        meta.textContent = rangeText(obj);
+        button.append(label, meta);
+        button.addEventListener("click", () => selectObject(obj.id));
+        objectsEl.appendChild(button);
+      }
+    }
+
+    function selectClip(id) {
+      selectedClip = clips.find((clip) => clip.id === id) || null;
+      selectedObject = null;
+      boxEl.hidden = true;
+      if (selectedClip) video.src = "/media/" + selectedClip.id;
+      renderClips();
+      renderObjects();
+    }
+
+    function selectObject(id) {
+      if (!selectedClip) return;
+      selectedObject = selectedClip.objects.find((obj) => obj.id === id) || null;
+      renderObjects();
+      if (!selectedObject) return;
+      const seek = () => {
+        video.pause();
+        video.currentTime = Number(selectedObject.start_s);
+        draw();
+      };
+      if (video.readyState >= 1) seek();
+      else video.addEventListener("loadedmetadata", seek, { once: true });
+    }
+
+    video.addEventListener("seeked", draw);
+    video.addEventListener("timeupdate", draw);
+
+    fetch("/api/clips")
+      .then((res) => res.json())
+      .then((data) => {
+        clips = data;
+        renderClips();
+        if (clips.length) selectClip(clips[0].id);
+      });
+  </script>
+</body>
+</html>
