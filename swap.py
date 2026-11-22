@@ -30,6 +30,7 @@ API = "https://openrouter.ai/api/v1/videos"
 MODEL = "alibaba/wan-3.0"
 RESOLUTION = "720p"
 ASPECT_RATIO = "16:9"
+_ASPECTS = ("16:9", "4:3", "1:1", "3:4", "9:16", "21:9")
 MIN_WINDOW_S = 2.0
 POLL_EVERY_S = 20.0
 PRESIGN_SECONDS = 3 * 60 * 60
@@ -110,6 +111,7 @@ def video_request(
     duration: int,
     seed: int,
     image_url: str | None = None,
+    aspect_ratio: str = ASPECT_RATIO,
 ) -> dict:
     refs = [{"type": "video_url", "video_url": {"url": _https(video_url)}}]
     if image_url:
@@ -120,10 +122,36 @@ def video_request(
         "input_references": refs,
         "duration": int(duration),
         "resolution": RESOLUTION,
-        "aspect_ratio": ASPECT_RATIO,
+        "aspect_ratio": aspect_ratio,
         "generate_audio": False,
         "seed": int(seed),
     }
+
+
+def choose_aspect(width: int, height: int, supported: list[str] | None = None) -> str:
+    """The supported ratio closest to the frame, so the edit is not restaged."""
+    options = [item for item in (supported or _ASPECTS) if _ratio(item) is not None]
+    if not options or width < 1 or height < 1:
+        return ASPECT_RATIO
+    target = float(width) / float(height)
+    return min(options, key=lambda item: abs(target - _ratio(item)))
+
+
+def aspects_for(payload: Any) -> list[str]:
+    models = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(models, list):
+        return list(_ASPECTS)
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        if (model.get("id") or model.get("canonical_slug")) != MODEL:
+            continue
+        found = []
+        for item in model.get("supported_aspect_ratios") or []:
+            if isinstance(item, str) and _ratio(item.strip()) is not None:
+                found.append(item.strip())
+        return found or list(_ASPECTS)
+    return list(_ASPECTS)
 
 
 def durations_for(payload: Any) -> tuple[list[int], int]:
@@ -318,7 +346,10 @@ def finish_clip(generated: Path, window: Path, dest: Path) -> None:
     filters = []
     if plan["scale"] is not None:
         width, height = plan["scale"]
-        filters.append(f"scale={width}:{height}:flags=lanczos")
+        filters.append(
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+        )
     if plan["fps"] is not None:
         filters.append(f"fps={plan['fps']}")
     if filters:
@@ -524,7 +555,7 @@ def execute_swap(job_id: str, *, root: Path | None, deps: SwapDeps, key: str) ->
         raise RuntimeError("video missing")
 
     model_deadline = clock() + MODELS_BUDGET_S
-    supported, model_max = _model_durations(
+    supported, model_max, aspects = _model_limits(
         transport, sleep=sleep, clock=clock, deadline=model_deadline, interval=interval
     )
     duration_s, width, height = probe_video(video)
@@ -551,7 +582,15 @@ def execute_swap(job_id: str, *, root: Path | None, deps: SwapDeps, key: str) ->
     box = _box_for(obj)
     position = position_phrase(box, width, height) if box else "center of the frame"
     prompt = swap_prompt(str(obj.get("label") or "object"), position, product, reference_image=image_url is not None)
-    body = video_request(prompt, video_url, duration, swap_seed(clip_id, object_id, product), image_url)
+    aspect = choose_aspect(width, height, aspects)
+    body = video_request(
+        prompt,
+        video_url,
+        duration,
+        swap_seed(clip_id, object_id, product),
+        image_url,
+        aspect_ratio=aspect,
+    )
     deadline = clock() + poll_budget_s(duration)
     _update(job_id, detail="submitting")
 
@@ -619,10 +658,11 @@ def _worker(job_id: str, root: Path | None, deps: SwapDeps) -> None:
         _update(job_id, status="failed", error=_public_error(exc, key), detail="")
 
 
-def _model_durations(transport: Transport, *, sleep: Sleep, clock: Clock, deadline: float, interval: float):
+def _model_limits(transport: Transport, *, sleep: Sleep, clock: Clock, deadline: float, interval: float):
     def op():
         data = transport("GET", f"{API}/models", None)
-        return durations_for(data)
+        supported, model_max = durations_for(data)
+        return supported, model_max, aspects_for(data)
 
     return _retry(op, sleep=sleep, clock=clock, deadline=deadline, interval=interval)
 
@@ -767,6 +807,20 @@ def _duration_list(raw: Any) -> list[int]:
         if number > 0:
             found.append(number)
     return sorted(set(found))
+
+
+def _ratio(text: str) -> float | None:
+    left, sep, right = str(text).partition(":")
+    if not sep:
+        return None
+    try:
+        width = float(left)
+        height = float(right)
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width / height
 
 
 def _band(value: float) -> int:

@@ -20,6 +20,8 @@ from swap import (
     HttpError,
     SwapDeps,
     _public_error,
+    aspects_for,
+    choose_aspect,
     choose_duration,
     download_output,
     durations_for,
@@ -118,6 +120,32 @@ def _probe(path: Path) -> dict:
     }
 
 
+def _pixel(path: Path, x: int, y: int) -> tuple[int, int, int]:
+    info = _probe(path)
+    proc = subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    index = (y * info["width"] + x) * 3
+    raw = proc.stdout
+    return (raw[index], raw[index + 1], raw[index + 2])
+
+
 def _rgb(path: Path) -> tuple[float, float, float]:
     proc = subprocess.run(
         [
@@ -185,6 +213,18 @@ def test_request_names_the_object_the_position_and_the_lighting():
     assert [ref["type"] for ref in bare["input_references"]] == ["video_url"]
     with pytest.raises(ValueError, match="https"):
         video_request(prompt, "data:video/mp4;base64,AAAA", 2, 1)
+
+
+def test_aspect_follows_the_frame_instead_of_stretching_it():
+    listed = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9"]
+    payload = {"data": [{"id": "alibaba/wan-3.0", "supported_aspect_ratios": listed}]}
+    assert aspects_for(payload) == listed
+    assert choose_aspect(1920, 1080, listed) == "16:9"
+    assert choose_aspect(1080, 1920, listed) == "9:16"
+    assert choose_aspect(1080, 1080, listed) == "1:1"
+    assert choose_aspect(1440, 1080, listed) == "4:3"
+    assert choose_aspect(1080, 1440, listed) == "3:4"
+    assert video_request("prompt", "https://media.example/v.mp4", 2, 1, aspect_ratio="9:16")["aspect_ratio"] == "9:16"
 
 
 def test_window_is_padded_and_clamped_to_the_model_max():
@@ -375,6 +415,19 @@ def test_finish_muxes_source_audio_and_matches_the_frame(tmp_path):
     red, green, blue = _rgb(dest)
     assert blue > red + 20
     assert blue > green + 20
+
+    tall = tmp_path / "tall.mp4"
+    wide = tmp_path / "wide.mp4"
+    fitted = tmp_path / "fitted.mp4"
+    _color(tall, "green", "180x320", 1, 25, audio=False)
+    _color(wide, "blue", "320x180", 1, 25, audio=False)
+    finish_clip(wide, tall, fitted)
+    info = _probe(fitted)
+    assert (info["width"], info["height"]) == (180, 320)
+    center = _pixel(fitted, 90, 160)
+    edge = _pixel(fitted, 90, 4)
+    assert center[2] > center[0] + 20
+    assert max(edge) < 40
 
 
 def test_transport_sends_the_key_only_as_a_header(monkeypatch):

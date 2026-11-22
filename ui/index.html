@@ -427,20 +427,30 @@
     }
 
     let leader = null;
+    let echoing = false;
     function follow(from, to) {
       from.addEventListener("play", () => {
+        if (echoing) return;
         leader = from;
-        if (to.src) to.play().catch(() => {});
+        if (!to.getAttribute("src")) return;
+        echoing = true;
+        const pending = to.play();
+        const release = () => { echoing = false; };
+        if (pending && pending.then) pending.then(release, release);
+        else release();
       });
       from.addEventListener("pause", () => {
-        if (leader === from) to.pause();
+        if (echoing || leader !== from) return;
+        echoing = true;
+        to.pause();
+        echoing = false;
       });
       from.addEventListener("seeked", () => {
-        if (leader !== from || !to.src) return;
+        if (echoing || leader !== from || !to.getAttribute("src")) return;
         if (Math.abs(from.currentTime - to.currentTime) > 0.05) to.currentTime = from.currentTime;
       });
       from.addEventListener("timeupdate", () => {
-        if (leader !== from || from.paused || !to.src) return;
+        if (echoing || leader !== from || from.paused || !to.getAttribute("src")) return;
         if (Math.abs(from.currentTime - to.currentTime) > 0.3) to.currentTime = from.currentTime;
       });
     }
