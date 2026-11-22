@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from store import get_clip, list_clips, load_dotenv
-from swap import SwapDeps, decode_image, get_swap, list_swaps, start_swap, swap_path
+from swap import SwapBusy, SwapDeps, decode_image, get_swap, list_swaps, start_swap, swap_path
 
 INDEX = Path(__file__).with_name("ui") / "index.html"
 _ID = re.compile(r"^[0-9a-f]{6,32}$")
@@ -107,14 +107,18 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._json({"error": str(exc)}, status=400)
             return
-        job = start_swap(
-            clip_id=clip_id,
-            object_id=object_id,
-            product=product.strip(),
-            image=image,
-            root=self.db_root,
-            deps=self.deps,
-        )
+        try:
+            job = start_swap(
+                clip_id=clip_id,
+                object_id=object_id,
+                product=product.strip(),
+                image=image,
+                root=self.db_root,
+                deps=self.deps,
+            )
+        except SwapBusy as exc:
+            self._json({"error": str(exc)}, status=409)
+            return
         self._json(job, status=202)
 
     def _json_body(self) -> dict:

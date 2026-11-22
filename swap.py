@@ -53,6 +53,10 @@ class HttpError(Exception):
         super().__init__(f"openrouter HTTP {code}: {detail}")
 
 
+class SwapBusy(Exception):
+    """A swap is already queued or running."""
+
+
 @dataclass
 class SwapDeps:
     transport: Transport | None = None
@@ -213,26 +217,17 @@ def place_window(start_s: float, end_s: float, video_duration: float, duration_s
 
 
 def poll_budget_s(duration_s: float) -> float:
-    """About eight minutes for each ten seconds of generated video."""
-    return max(1.0, float(duration_s) / 10.0) * 8.0 * 60.0
+    """Twelve minutes, or 1.5 times eight minutes per ten seconds, whichever is longer."""
+    nominal = max(1.0, float(duration_s) / 10.0) * 8.0 * 60.0
+    return max(12.0 * 60.0, nominal * 1.5)
 
 
-def submit_video(
-    body: dict,
-    transport: Transport,
-    *,
-    sleep: Sleep,
-    clock: Clock,
-    deadline: float,
-    interval: float = POLL_EVERY_S,
-) -> str:
-    def op() -> str:
-        data = transport("POST", API, body)
-        if not isinstance(data, dict) or not str(data.get("id") or "").strip():
-            raise RuntimeError("openrouter response missing id")
-        return str(data["id"]).strip()
-
-    return _retry(op, sleep=sleep, clock=clock, deadline=deadline, interval=interval)
+def submit_video(body: dict, transport: Transport) -> str:
+    """POST the job once. A retry would start a second billed generation."""
+    data = transport("POST", API, body)
+    if not isinstance(data, dict) or not str(data.get("id") or "").strip():
+        raise RuntimeError("openrouter response missing id")
+    return str(data["id"]).strip()
 
 
 def poll_video(
@@ -302,9 +297,7 @@ def generate_clip(
     interval: float = POLL_EVERY_S,
 ) -> bytes:
     """Submit once, then only poll and download that job."""
-    job_id = submit_video(
-        body, transport, sleep=sleep, clock=clock, deadline=deadline, interval=interval
-    )
+    job_id = submit_video(body, transport)
     completed = poll_video(
         job_id,
         transport,
@@ -352,16 +345,36 @@ def finish_clip(generated: Path, window: Path, dest: Path) -> None:
         )
     if plan["fps"] is not None:
         filters.append(f"fps={plan['fps']}")
+    frames = int(source.get("frames") or 0)
+    lock_frames = not plan["copy_video"] and frames > 0 and float(source.get("fps") or 0) > 0
+    if lock_frames:
+        filters.append("tpad=stop_mode=clone:stop_duration=2")
     if filters:
         cmd += ["-vf", ",".join(filters)]
     cmd += ["-map", "0:v:0"]
     if plan["audio"]:
-        cmd += ["-map", "1:a:0", "-c:a", "copy"]
+        cmd += ["-map", "1:a:0"]
+        if lock_frames:
+            duration = frames / float(source["fps"])
+            cmd += [
+                "-af",
+                f"atrim=duration={duration:.6f},apad=whole_dur={duration:.6f},asetpts=PTS-STARTPTS",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+            ]
+        else:
+            cmd += ["-c:a", "copy"]
     if plan["copy_video"]:
         cmd += ["-c:v", "copy"]
     else:
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
-    cmd += ["-movflags", "+faststart", "-shortest", str(dest)]
+    if lock_frames:
+        cmd += ["-frames:v", str(frames)]
+    else:
+        cmd += ["-shortest"]
+    cmd += ["-movflags", "+faststart", str(dest)]
     _run(cmd)
 
 
@@ -411,16 +424,19 @@ def s3_upload(path: Path, object_key: str, content_type: str) -> str:
     access = (os.environ.get("AWS_ACCESS_KEY_ID") or "").strip()
     secret = (os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip()
     region = (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1").strip()
+    endpoint = (os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL") or "").strip()
     if not bucket or not access or not secret:
         raise RuntimeError("AWS_S3_BUCKET_NAME, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY must be set")
     import boto3
 
-    client = boto3.client(
-        "s3",
-        region_name=region,
-        aws_access_key_id=access,
-        aws_secret_access_key=secret,
-    )
+    client_args = {
+        "region_name": region,
+        "aws_access_key_id": access,
+        "aws_secret_access_key": secret,
+    }
+    if endpoint:
+        client_args["endpoint_url"] = endpoint
+    client = boto3.client("s3", **client_args)
     client.upload_file(str(path), bucket, object_key, ExtraArgs={"ContentType": content_type})
     url = client.generate_presigned_url(
         "get_object",
@@ -481,12 +497,15 @@ def start_swap(
         "status": "queued",
         "detail": "",
         "progress": None,
+        "cost": None,
         "error": None,
         "window_ready": False,
         "created": time.time(),
         "_image": image,
     }
     with _lock:
+        if any(item["status"] in {"queued", "running"} for item in _jobs.values()):
+            raise SwapBusy("a swap is already running")
         _jobs[job_id] = job
         public = _public(job)
     threading.Thread(
@@ -599,6 +618,9 @@ def execute_swap(job_id: str, *, root: Path | None, deps: SwapDeps, key: str) ->
         progress = _progress(data)
         if progress is not None:
             fields["progress"] = progress
+        cost = _usage_cost(data)
+        if cost is not None:
+            fields["cost"] = cost
         _update(job_id, **fields)
 
     raw = generate_clip(
@@ -700,6 +722,7 @@ def _public(job: dict) -> dict:
         "status": job["status"],
         "detail": job["detail"],
         "progress": job["progress"],
+        "cost": job.get("cost"),
         "error": job["error"],
         "window_url": f"/swaps/{job['id']}/window" if job["window_ready"] else None,
         "result_url": f"/swaps/{job['id']}/result" if ready else None,
@@ -727,8 +750,9 @@ def _streams(path: Path) -> dict:
             "ffprobe",
             "-v",
             "error",
+            "-count_frames",
             "-show_entries",
-            "stream=codec_type,width,height,avg_frame_rate,r_frame_rate",
+            "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames,duration",
             "-of",
             "json",
             str(path),
@@ -750,6 +774,8 @@ def _streams(path: Path) -> dict:
         "height": int(video["height"]),
         "fps": fps,
         "fps_arg": fps_arg,
+        "frames": _frame_count(video),
+        "duration": _stream_duration(video),
         "has_audio": has_audio,
     }
 
@@ -844,6 +870,35 @@ def _absolute(url: str) -> str:
 
 def _one_line(text: str) -> str:
     return " ".join(str(text).split())
+
+
+def _frame_count(stream: dict) -> int:
+    for key in ("nb_read_frames", "nb_frames"):
+        raw = stream.get(key)
+        if isinstance(raw, str) and raw.isdigit() and int(raw) > 0:
+            return int(raw)
+        if isinstance(raw, int) and raw > 0:
+            return raw
+    return 0
+
+
+def _stream_duration(stream: dict) -> float:
+    raw = stream.get("duration")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 0 else 0.0
+
+
+def _usage_cost(data: dict) -> float | None:
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("cost")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
 
 
 def _progress(data: dict) -> int | None:

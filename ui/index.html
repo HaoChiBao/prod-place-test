@@ -254,10 +254,19 @@
       }
     }
 
+    function money(value) {
+      return "$" + Number(value).toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+    }
+
     function statusText(job) {
       if (job.status === "queued") return "Queued";
       if (job.status === "failed") return job.error || "Swap failed";
-      if (job.status === "completed") return "Done";
+      if (job.status === "completed") {
+        if (job.cost != null && !Number.isNaN(Number(job.cost))) {
+          return "Done · " + money(job.cost);
+        }
+        return "Done";
+      }
       if (job.detail === "cutting") return "Cutting the window";
       if (job.detail === "uploading") return "Uploading the clip";
       if (job.detail === "submitting") return "Starting the swap";

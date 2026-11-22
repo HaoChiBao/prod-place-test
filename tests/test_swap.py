@@ -18,6 +18,7 @@ from store import list_clips, save_findings
 from swap import (
     API,
     HttpError,
+    SwapBusy,
     SwapDeps,
     _public_error,
     aspects_for,
@@ -28,9 +29,13 @@ from swap import (
     finish_clip,
     finish_plan,
     generate_clip,
+    get_swap,
     place_window,
+    poll_budget_s,
     poll_video,
     position_phrase,
+    start_swap,
+    submit_video,
     reset_jobs,
     swap_prompt,
     urllib_transport,
@@ -322,7 +327,7 @@ def test_poll_retries_transient_errors_and_stops_on_terminal_states():
 
 def test_a_running_job_is_polled_and_not_resubmitted():
     calls = []
-    posts = [ConnectionError("reset"), {"id": "job-7", "status": "pending"}]
+    posts = [{"id": "job-7", "status": "pending"}]
     polls = [
         HttpError(429, "slow"),
         HttpError(502, "down"),
@@ -357,10 +362,10 @@ def test_a_running_job_is_polled_and_not_resubmitted():
     body = video_request("Replace the bottle", "https://media.example/window.mp4", 2, 3)
     data = generate_clip(body, transport, sleep=sleep, clock=now, deadline=10_000, interval=20)
     assert data == video
-    assert [call[0] for call in calls].count("POST") == 2
-    assert [index for index, call in enumerate(calls) if call[0] == "POST"] == [0, 1]
-    assert calls[1][2]["model"] == "alibaba/wan-3.0"
-    assert calls[1][2]["generate_audio"] is False
+    assert [call[0] for call in calls].count("POST") == 1
+    assert calls[0][0] == "POST"
+    assert calls[0][2]["model"] == "alibaba/wan-3.0"
+    assert calls[0][2]["generate_audio"] is False
     assert state["t"] > 0
     assert posts == [] and polls == [] and downloads == []
 
@@ -383,6 +388,140 @@ def test_a_running_job_is_polled_and_not_resubmitted():
     )
     assert raw == video
     assert saved["url"] == "https://cdn.example/out.mp4"
+
+
+def test_poll_budget_is_the_longer_of_twelve_minutes_or_one_and_a_half():
+    assert poll_budget_s(2) == 12 * 60
+    assert poll_budget_s(10) == 12 * 60
+    assert poll_budget_s(30) == 36 * 60
+
+
+def test_submit_is_not_retried():
+    calls = {"n": 0}
+
+    def broken(method, url, payload):
+        calls["n"] += 1
+        raise ConnectionError("reset")
+
+    with pytest.raises(ConnectionError):
+        submit_video({"model": "alibaba/wan-3.0"}, broken)
+    assert calls["n"] == 1
+
+    calls["n"] = 0
+
+    def limited(method, url, payload):
+        calls["n"] += 1
+        raise HttpError(503, "down")
+
+    with pytest.raises(HttpError):
+        submit_video({"model": "alibaba/wan-3.0"}, limited)
+    assert calls["n"] == 1
+
+
+def test_a_second_swap_is_rejected_while_one_is_queued(tmp_path):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"x")
+    save_findings(
+        str(video),
+        [
+            {
+                "id": "obj1",
+                "label": "cup",
+                "category": "other",
+                "start_s": 0.0,
+                "end_s": 1.0,
+                "visibility": 1.0,
+                "boxes": [],
+            }
+        ],
+        0,
+        root=tmp_path,
+    )
+    clip = list_clips(tmp_path)[0]
+    hold = threading.Event()
+    entered = threading.Event()
+
+    def prepare():
+        entered.set()
+        assert hold.wait(5)
+
+    deps = SwapDeps(prepare=prepare)
+    kwargs = {
+        "clip_id": clip["id"],
+        "object_id": clip["objects"][0]["id"],
+        "image": None,
+        "root": tmp_path,
+        "deps": deps,
+    }
+    first = start_swap(product="Starbucks cup", **kwargs)
+    try:
+        assert entered.wait(2)
+        with pytest.raises(SwapBusy, match="already"):
+            start_swap(product="Another cup", **kwargs)
+        assert get_swap(first["id"])["status"] == "queued"
+    finally:
+        hold.set()
+
+    def wait_done(swap_id: str) -> dict:
+        deadline = time.monotonic() + 5
+        job = get_swap(swap_id)
+        while time.monotonic() < deadline:
+            job = get_swap(swap_id)
+            if job and job["status"] in {"failed", "completed"}:
+                return job
+            time.sleep(0.02)
+        return job
+
+    assert wait_done(first["id"])["status"] == "failed"
+    second = start_swap(product="Another cup", **kwargs)
+    assert second["status"] == "queued"
+    assert wait_done(second["id"])["status"] == "failed"
+
+
+def _counted(path: Path, color: str, size: str, rate: str, frames: int, audio: bool) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c={color}:s={size}:r={rate}",
+    ]
+    if audio:
+        cmd += ["-f", "lavfi", "-i", "sine=frequency=440:r=48000"]
+    cmd += ["-frames:v", str(frames), "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+    if audio:
+        cmd += ["-c:a", "aac", "-shortest"]
+    else:
+        cmd += ["-an"]
+    cmd.append(str(path))
+    _ffmpeg(cmd)
+
+
+def _frames(path: Path) -> tuple[int, float]:
+    proc = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames,duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stream = json.loads(proc.stdout)["streams"][0]
+    return int(stream["nb_read_frames"]), float(stream["duration"])
 
 
 def test_finish_muxes_source_audio_and_matches_the_frame(tmp_path):
@@ -428,6 +567,20 @@ def test_finish_muxes_source_audio_and_matches_the_frame(tmp_path):
     edge = _pixel(fitted, 90, 4)
     assert center[2] > center[0] + 20
     assert max(edge) < 40
+
+
+def test_finish_matches_the_window_frame_count(tmp_path):
+    window = tmp_path / "film.mp4"
+    generated = tmp_path / "wan.mp4"
+    dest = tmp_path / "matched.mp4"
+    _counted(window, "green", "64x64", "24000/1001", 143, audio=True)
+    _counted(generated, "blue", "128x72", "30", 174, audio=False)
+    finish_clip(generated, window, dest)
+    window_frames, window_duration = _frames(window)
+    out_frames, out_duration = _frames(dest)
+    assert window_frames == 143
+    assert out_frames == window_frames
+    assert out_duration == pytest.approx(window_duration, abs=0.05)
 
 
 def test_transport_sends_the_key_only_as_a_header(monkeypatch):
@@ -531,6 +684,7 @@ def test_swap_returns_before_the_job_and_serves_the_result(tmp_path, monkeypatch
                 "id": "job-1",
                 "status": "completed",
                 "progress": 100,
+                "usage": {"cost": 0.72},
                 "unsigned_urls": ["/api/v1/videos/job-1/content?index=0"],
             }
         if method == "GET" and "/content" in url:
@@ -547,6 +701,7 @@ def test_swap_returns_before_the_job_and_serves_the_result(tmp_path, monkeypatch
         assert "Replace object" in page
         assert 'id="original"' in page
         assert 'id="result"' in page
+        assert "job.cost" in page
         target = f"{base}/api/clips/{clip['id']}/objects/{obj['id']}/swap"
 
         def post(payload):
@@ -579,6 +734,10 @@ def test_swap_returns_before_the_job_and_serves_the_result(tmp_path, monkeypatch
         assert entered.wait(2)
         mid = json.load(urllib.request.urlopen(base + "/api/swaps/" + posted["id"]))
         assert mid["status"] == "queued"
+        with pytest.raises(urllib.error.HTTPError) as busy:
+            post({"product": "Second product"})
+        assert busy.value.code == 409
+        busy.value.close()
         hold.set()
 
         deadline = time.monotonic() + 30
@@ -589,6 +748,7 @@ def test_swap_returns_before_the_job_and_serves_the_result(tmp_path, monkeypatch
                 break
             time.sleep(0.05)
         assert job["status"] == "completed", job
+        assert job["cost"] == 0.72
         assert job["result_url"]
         assert job["window_url"]
         body = seen["body"]
