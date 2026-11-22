@@ -130,7 +130,7 @@
         </figure>
         <figure>
           <figcaption id="result-caption">Swapped</figcaption>
-          <video id="result" controls playsinline preload="auto"></video>
+          <video id="result" controls playsinline preload="auto" muted></video>
         </figure>
       </div>
       <div class="objects" id="objects"></div>
@@ -444,6 +444,8 @@
           return;
         }
         leader = from;
+        from.muted = false;
+        to.muted = true;
         if (!to.getAttribute("src")) return;
         echoPlay = to;
         if (!to.paused) {

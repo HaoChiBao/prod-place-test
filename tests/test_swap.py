@@ -21,7 +21,9 @@ from swap import (
     SwapBusy,
     SwapDeps,
     _public_error,
+    _streams,
     aspects_for,
+    cut_window,
     choose_aspect,
     choose_duration,
     download_output,
@@ -655,6 +657,40 @@ def test_finish_muxes_source_audio_and_matches_the_frame(tmp_path):
     edge = _pixel(fitted, 90, 4)
     assert center[2] > center[0] + 20
     assert max(edge) < 40
+
+
+def test_cutting_does_not_decode_the_whole_source(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd):
+        calls.append(list(cmd))
+        payload = {
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "width": 64,
+                    "height": 64,
+                    "avg_frame_rate": "25/1",
+                    "r_frame_rate": "25/1",
+                    "nb_frames": "25",
+                    "nb_read_frames": "25",
+                    "duration": "1.0",
+                },
+                {"codec_type": "audio"},
+            ]
+        }
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr("swap._run", fake_run)
+    cut_window(tmp_path / "source.mp4", tmp_path / "window.mp4", 0.0, 2.0)
+    probes = [cmd for cmd in calls if cmd[0] == "ffprobe"]
+    assert len(probes) == 1
+    assert "-count_frames" not in probes[0]
+    calls.clear()
+    info = _streams(tmp_path / "source.mp4", count_frames=True)
+    assert info["frames"] == 25
+    assert info["has_audio"] is True
+    assert "-count_frames" in calls[0]
 
 
 def test_finish_matches_the_window_frame_count(tmp_path):

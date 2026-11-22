@@ -331,7 +331,7 @@ def finish_plan(source: dict, generated: dict) -> dict:
 
 def finish_clip(generated: Path, window: Path, dest: Path) -> None:
     """Match the generated picture to the window, and mux the window's audio."""
-    source = _streams(window)
+    source = _streams(window, count_frames=True)
     plan = finish_plan(source, _streams(generated))
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(generated)]
     if plan["audio"]:
@@ -747,20 +747,15 @@ def _box_for(obj: dict) -> dict | None:
     return min(boxes, key=lambda box: abs(float(box.get("t") or mid) - mid))
 
 
-def _streams(path: Path) -> dict:
-    proc = _run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-count_frames",
-            "-show_entries",
-            "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames,duration",
-            "-of",
-            "json",
-            str(path),
-        ]
-    )
+def _streams(path: Path, *, count_frames: bool = False) -> dict:
+    fields = "codec_type,width,height,avg_frame_rate,r_frame_rate,nb_frames,duration"
+    if count_frames:
+        fields = "codec_type,width,height,avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames,duration"
+    cmd = ["ffprobe", "-v", "error"]
+    if count_frames:
+        cmd.append("-count_frames")
+    cmd += ["-show_entries", f"stream={fields}", "-of", "json", str(path)]
+    proc = _run(cmd)
     data = json.loads(proc.stdout)
     video = None
     has_audio = False
