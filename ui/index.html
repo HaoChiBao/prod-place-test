@@ -13,9 +13,7 @@
       background: #12141a;
       color: #f2f4f8;
     }
-    header {
-      padding: 16px 20px 8px;
-    }
+    header { padding: 16px 20px 8px; }
     h1 { font-size: 18px; margin: 0 0 4px; }
     p.note { margin: 0; color: #a8b0c0; font-size: 13px; }
     main { display: grid; grid-template-columns: 280px 1fr; gap: 16px; padding: 12px 20px 24px; }
@@ -34,11 +32,7 @@
       background: #2a2614;
     }
     button .meta { display: block; color: #a8b0c0; font-size: 12px; margin-top: 2px; }
-    .stage {
-      position: relative;
-      width: min(100%, 960px);
-      background: #000;
-    }
+    .stage { position: relative; width: min(100%, 960px); background: #000; }
     video { display: block; width: 100%; height: auto; background: #000; }
     .box {
       position: absolute;
@@ -57,16 +51,57 @@
       padding: 1px 6px;
       white-space: nowrap;
     }
+    .swap {
+      width: min(100%, 960px);
+      margin-top: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .swap h2 { font-size: 15px; margin: 0; }
+    .swap label { display: flex; flex-direction: column; gap: 4px; color: #a8b0c0; font-size: 12px; }
+    .swap input[type="text"], .swap input[type="file"] {
+      background: #1c2030;
+      color: inherit;
+      border: 1px solid #2c3348;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font: inherit;
+    }
+    button.go {
+      background: #f5c518;
+      color: #1a1400;
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font: inherit;
+      font-weight: 650;
+      width: fit-content;
+      cursor: pointer;
+    }
+    button.go:disabled { opacity: 0.55; cursor: default; }
+    #swap-status { margin: 0; min-height: 1.2em; }
+    .compare {
+      width: min(100%, 960px);
+      margin-top: 12px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .compare figcaption { color: #a8b0c0; font-size: 12px; margin-bottom: 4px; }
+    .compare figure { margin: 0; }
     .empty { color: #a8b0c0; }
+    .objects { margin-top: 12px; }
     @media (max-width: 800px) {
       main { grid-template-columns: 1fr; }
+      .compare { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
   <header>
     <h1>Swappable objects</h1>
-    <p class="note">Pick a clip, then an object. The video jumps to when it appears and the box is drawn on the frame.</p>
+    <p class="note">Pick a clip and an object. Name the product to put in its place, and the swap plays beside the original.</p>
   </header>
   <main>
     <section>
@@ -77,6 +112,27 @@
         <video id="video" controls playsinline></video>
         <div class="box" id="box" hidden><span id="box-label"></span></div>
       </div>
+      <div class="swap" id="swap" hidden>
+        <h2 id="swap-title"></h2>
+        <label>Product
+          <input id="product" type="text" maxlength="200" placeholder="Brand product" autocomplete="off">
+        </label>
+        <label>Product image, optional
+          <input id="product-image" type="file" accept="image/jpeg,image/png,image/webp">
+        </label>
+        <button type="button" class="go" id="swap-go">Replace object</button>
+        <p id="swap-status"></p>
+      </div>
+      <div class="compare" id="compare" hidden>
+        <figure>
+          <figcaption>Original</figcaption>
+          <video id="original" controls playsinline preload="auto"></video>
+        </figure>
+        <figure>
+          <figcaption id="result-caption">Swapped</figcaption>
+          <video id="result" controls playsinline preload="auto"></video>
+        </figure>
+      </div>
       <div class="objects" id="objects"></div>
     </section>
   </main>
@@ -86,9 +142,23 @@
     const video = document.getElementById("video");
     const boxEl = document.getElementById("box");
     const boxLabel = document.getElementById("box-label");
+    const swapEl = document.getElementById("swap");
+    const swapTitle = document.getElementById("swap-title");
+    const productInput = document.getElementById("product");
+    const imageInput = document.getElementById("product-image");
+    const swapGo = document.getElementById("swap-go");
+    const swapStatus = document.getElementById("swap-status");
+    const compareEl = document.getElementById("compare");
+    const original = document.getElementById("original");
+    const result = document.getElementById("result");
+    const resultCaption = document.getElementById("result-caption");
     let clips = [];
     let selectedClip = null;
     let selectedObject = null;
+    let pollToken = 0;
+    let shownWindow = "";
+    let shownResult = "";
+    const swapsByObject = {};
 
     function fmt(t) {
       return (Math.round(Number(t) * 10) / 10).toFixed(1);
@@ -184,11 +254,91 @@
       }
     }
 
+    function statusText(job) {
+      if (job.status === "queued") return "Queued";
+      if (job.status === "failed") return job.error || "Swap failed";
+      if (job.status === "completed") return "Done";
+      if (job.detail === "cutting") return "Cutting the window";
+      if (job.detail === "uploading") return "Uploading the clip";
+      if (job.detail === "submitting") return "Starting the swap";
+      if (job.progress != null) return "Generating " + job.progress + "%";
+      return "Generating";
+    }
+
+    function showJob(job) {
+      swapStatus.textContent = statusText(job);
+      swapGo.disabled = job.status === "queued" || job.status === "running";
+      resultCaption.textContent = job.product ? "With " + job.product : "Swapped";
+      if (job.window_url && shownWindow !== job.window_url) {
+        shownWindow = job.window_url;
+        original.src = job.window_url;
+        compareEl.hidden = false;
+      }
+      if (job.result_url && shownResult !== job.result_url) {
+        shownResult = job.result_url;
+        result.src = job.result_url;
+        compareEl.hidden = false;
+      }
+    }
+
+    function clearSwapView() {
+      shownWindow = "";
+      shownResult = "";
+      compareEl.hidden = true;
+      for (const player of [original, result]) {
+        if (player.getAttribute("src")) {
+          player.removeAttribute("src");
+          player.load();
+        }
+      }
+      swapStatus.textContent = "";
+      swapGo.disabled = false;
+      resultCaption.textContent = "Swapped";
+    }
+
+    async function pollSwap(id, token) {
+      while (token === pollToken) {
+        let job;
+        try {
+          const res = await fetch("/api/swaps/" + id);
+          job = await res.json();
+        } catch (err) {
+          if (token !== pollToken) return;
+          swapStatus.textContent = "Could not read the swap status";
+          return;
+        }
+        if (token !== pollToken) return;
+        if (job.error && !job.status) {
+          swapStatus.textContent = job.error;
+          return;
+        }
+        showJob(job);
+        if (job.status === "completed" || job.status === "failed") return;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
+    function remember(job) {
+      if (job && job.object_id) swapsByObject[job.object_id] = job.id;
+    }
+
     function selectClip(id) {
       selectedClip = clips.find((clip) => clip.id === id) || null;
       selectedObject = null;
+      pollToken += 1;
       boxEl.hidden = true;
-      if (selectedClip) video.src = "/media/" + selectedClip.id;
+      swapEl.hidden = true;
+      clearSwapView();
+      if (selectedClip) {
+        video.src = "/media/" + selectedClip.id;
+        fetch("/api/clips/" + selectedClip.id + "/swaps")
+          .then((res) => res.json())
+          .then((jobs) => {
+            if (!selectedClip || selectedClip.id !== id || !Array.isArray(jobs)) return;
+            for (const job of jobs) remember(job);
+          })
+          .catch(() => {});
+      }
       renderClips();
       renderObjects();
     }
@@ -197,7 +347,16 @@
       if (!selectedClip) return;
       selectedObject = selectedClip.objects.find((obj) => obj.id === id) || null;
       renderObjects();
-      if (!selectedObject) return;
+      pollToken += 1;
+      clearSwapView();
+      imageInput.value = "";
+      if (!selectedObject) {
+        swapEl.hidden = true;
+        return;
+      }
+      swapEl.hidden = false;
+      swapTitle.textContent = "Replace the " + selectedObject.label;
+      productInput.value = selectedObject.suggested_product || "";
       const seek = () => {
         video.pause();
         video.currentTime = Number(selectedObject.start_s);
@@ -205,8 +364,90 @@
       };
       if (video.readyState >= 1) seek();
       else video.addEventListener("loadedmetadata", seek, { once: true });
+      const existing = swapsByObject[selectedObject.id];
+      if (existing) pollSwap(existing, pollToken);
     }
 
+    function fileToBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const text = String(reader.result || "");
+          const comma = text.indexOf(",");
+          resolve(comma >= 0 ? text.slice(comma + 1) : text);
+        };
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function startReplace() {
+      if (!selectedClip || !selectedObject) return;
+      const clipId = selectedClip.id;
+      const objectId = selectedObject.id;
+      const product = productInput.value.trim();
+      if (!product) {
+        swapStatus.textContent = "Enter a product name";
+        return;
+      }
+      const file = imageInput.files && imageInput.files[0];
+      if (file && file.size > 8000000) {
+        swapStatus.textContent = "Image is too large";
+        return;
+      }
+      const token = ++pollToken;
+      swapGo.disabled = true;
+      swapStatus.textContent = "Queued";
+      const body = { product };
+      if (file) body.image_base64 = await fileToBase64(file);
+      if (token !== pollToken) return;
+      let job;
+      try {
+        const res = await fetch(
+          "/api/clips/" + clipId + "/objects/" + objectId + "/swap",
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+        );
+        job = await res.json();
+        if (!res.ok) {
+          swapGo.disabled = false;
+          swapStatus.textContent = job.error || "Swap failed";
+          return;
+        }
+      } catch (err) {
+        swapGo.disabled = false;
+        swapStatus.textContent = "Could not start the swap";
+        return;
+      }
+      if (token !== pollToken) return;
+      remember(job);
+      shownWindow = "";
+      shownResult = "";
+      showJob(job);
+      pollSwap(job.id, token);
+    }
+
+    let leader = null;
+    function follow(from, to) {
+      from.addEventListener("play", () => {
+        leader = from;
+        if (to.src) to.play().catch(() => {});
+      });
+      from.addEventListener("pause", () => {
+        if (leader === from) to.pause();
+      });
+      from.addEventListener("seeked", () => {
+        if (leader !== from || !to.src) return;
+        if (Math.abs(from.currentTime - to.currentTime) > 0.05) to.currentTime = from.currentTime;
+      });
+      from.addEventListener("timeupdate", () => {
+        if (leader !== from || from.paused || !to.src) return;
+        if (Math.abs(from.currentTime - to.currentTime) > 0.3) to.currentTime = from.currentTime;
+      });
+    }
+    follow(original, result);
+    follow(result, original);
+
+    swapGo.addEventListener("click", startReplace);
     video.addEventListener("seeked", draw);
     video.addEventListener("timeupdate", draw);
 

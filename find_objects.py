@@ -292,6 +292,9 @@ def prompt_for(times: list[float]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from store import load_dotenv
+
+    load_dotenv()
     args = list(sys.argv[1:] if argv is None else argv)
     save = False
     if args and args[0] == "--save":

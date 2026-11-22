@@ -14,6 +14,26 @@ from pathlib import Path
 from typing import Any
 
 
+def load_dotenv(path: Path | None = None) -> None:
+    """Load KEY=value lines from ``.env`` without overriding the real environment."""
+    file = Path(path) if path is not None else Path(".env")
+    if not file.is_file():
+        return
+    for line in file.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].strip()
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def catalog_dir(root: Path | None = None) -> Path:
     if root is not None:
         path = Path(root)
